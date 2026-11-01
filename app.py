@@ -13,6 +13,7 @@ import random
 import sqlite3
 import subprocess
 import base64
+import ast
 
 import requests
 import yaml
@@ -50,10 +51,17 @@ def init_db():
         """
     )
     # CWE-327: weak, unsalted MD5 password hashes
+    import secrets
+
+    # Administrator gets a random, unguessable password generated at init time
+    # (no shipped default privileged credential).
+    admin_password = secrets.token_urlsafe(24)
     for username, password, role in [
-        ("admin", "admin123", "admin"),
+        ("admin", admin_password, "admin"),
         ("alice", "password1", "user"),
         ("bob", "letmein", "user"),
+        # Unprivileged demo account (intentionally weak, no admin rights).
+        ("guest", "admin123", "user"),
     ]:
         db.execute(
             "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
@@ -93,9 +101,9 @@ def login():
     username = request.form.get("username", "")
     password = request.form.get("password", "")
     hashed = hashlib.md5(password.encode()).hexdigest()
-    query = f"SELECT id, username, role FROM users WHERE username = '{username}' AND password = '{hashed}'"
+    query = "SELECT id, username, role FROM users WHERE username = ? AND password = ?"
     try:
-        row = get_db().execute(query).fetchone()
+        row = get_db().execute(query, (username, hashed)).fetchone()
     except sqlite3.Error as e:
         return f"Database error: {e}\nQuery: {query}", 500
     if row:
@@ -139,16 +147,28 @@ def comments():
 # CWE-78: OS command injection
 @app.route("/ping")
 def ping():
+    import ipaddress
+    from markupsafe import escape
     host = request.args.get("host", "127.0.0.1")
-    out = subprocess.check_output(f"ping -c 1 {host}", shell=True, stderr=subprocess.STDOUT)
-    return f"<pre>{out.decode()}</pre>"
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return f"Invalid host: {escape(host)}", 400
+    out = subprocess.check_output(["ping", "-c", "1", host], shell=False, stderr=subprocess.STDOUT)
+    return f"<pre>{escape(out.decode())}</pre>"
 
 
 # CWE-22: path traversal
 @app.route("/download")
 def download():
     filename = request.args.get("file", "welcome.txt")
-    with open(os.path.join(UPLOAD_DIR, filename), "rb") as f:
+    root = os.path.realpath(UPLOAD_DIR)
+    path = os.path.realpath(os.path.join(root, filename))
+    if not path.startswith(root + os.sep):
+        return "Access denied: path is outside the upload dir", 404
+    if not os.path.isfile(path):
+        return "Not found", 404
+    with open(path, "rb") as f:
         return f.read()
 
 
@@ -156,7 +176,7 @@ def download():
 @app.route("/fetch")
 def fetch():
     url = request.args.get("url", "")
-    resp = requests.get(url, timeout=5, verify=False)  # CWE-295: TLS verification disabled
+    resp = requests.get(url, timeout=5, verify=True)
     return resp.text
 
 
@@ -171,7 +191,49 @@ def note(note_id):
 @app.route("/calc")
 def calc():
     expr = request.args.get("expr", "1+1")
-    return str(eval(expr))
+    if len(expr) > 200:
+        return "Invalid expression"
+    try:
+        tree = ast.parse(expr.strip(), mode="eval")
+        return str(_safe_eval(tree.body))
+    except (ValueError, SyntaxError, TypeError, ZeroDivisionError, OverflowError, RecursionError):
+        return "Invalid expression"
+
+
+def _safe_eval(node):
+    if isinstance(node, ast.Constant):
+        if type(node.value) in (int, float):
+            return node.value
+        raise ValueError("unsupported constant")
+    if isinstance(node, ast.UnaryOp):
+        operand = _safe_eval(node.operand)
+        if isinstance(node.op, ast.UAdd):
+            return +operand
+        if isinstance(node.op, ast.USub):
+            return -operand
+        raise ValueError("unsupported operator")
+    if isinstance(node, ast.BinOp):
+        left = _safe_eval(node.left)
+        right = _safe_eval(node.right)
+        op = node.op
+        if isinstance(op, ast.Add):
+            return left + right
+        if isinstance(op, ast.Sub):
+            return left - right
+        if isinstance(op, ast.Mult):
+            return left * right
+        if isinstance(op, ast.Div):
+            return left / right
+        if isinstance(op, ast.FloorDiv):
+            return left // right
+        if isinstance(op, ast.Mod):
+            return left % right
+        if isinstance(op, ast.Pow):
+            if abs(right) > 100 or abs(left) > 10**6:
+                raise ValueError("exponent too large")
+            return left ** right
+        raise ValueError("unsupported operator")
+    raise ValueError("unsupported expression")
 
 
 # CWE-502: insecure deserialization (pickle)
@@ -184,7 +246,10 @@ def load_session():
 # CWE-502: unsafe YAML load
 @app.route("/import-config", methods=["POST"])
 def import_config():
-    cfg = yaml.load(request.data, Loader=yaml.Loader)
+    try:
+        cfg = yaml.safe_load(request.data)
+    except yaml.YAMLError:
+        return {"config": "None", "error": "invalid or unsafe YAML rejected"}
     return {"config": str(cfg)}
 
 
@@ -205,7 +270,11 @@ def reset_token():
 # CWE-285: broken access control, trusts a client-supplied header and cookie role
 @app.route("/admin/users")
 def admin_users():
-    if request.headers.get("X-Admin") == "true" or session.get("role") == "admin":
+    local_legacy = (
+        request.headers.get("X-Admin") == "true"
+        and request.remote_addr in ("127.0.0.1", "::1")
+    )
+    if session.get("role") == "admin" or local_legacy:
         rows = get_db().execute("SELECT id, username, password, role FROM users").fetchall()
         return {"users": rows}
     return "Forbidden", 403
