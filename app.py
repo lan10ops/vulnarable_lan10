@@ -93,9 +93,9 @@ def login():
     username = request.form.get("username", "")
     password = request.form.get("password", "")
     hashed = hashlib.md5(password.encode()).hexdigest()
-    query = f"SELECT id, username, role FROM users WHERE username = '{username}' AND password = '{hashed}'"
+    query = "SELECT id, username, role FROM users WHERE username = ? AND password = ?"
     try:
-        row = get_db().execute(query).fetchone()
+        row = get_db().execute(query, (username, hashed)).fetchone()
     except sqlite3.Error as e:
         return f"Database error: {e}\nQuery: {query}", 500
     if row:
